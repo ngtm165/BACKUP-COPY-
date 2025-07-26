@@ -1,84 +1,75 @@
-"""
-reaction_mpnn.py
------------------------------------------------------------
-PyG >= 2.5   •  torch >= 2.2  •  RDKit only for data prep (không dùng ở đây)
+# modified_mpnn.py
 
-File này kết hợp:
-1.  Kiến trúc GNN phân cấp cho phản ứng hóa học (từ mã gốc của bạn).
-2.  Một lớp LightningModule (`ReactionMPNN`) để tích hợp GNN vào một
-    quy trình huấn luyện tiêu chuẩn, tương tự như `chemprop`.
-3.  Một ví dụ về cách tải dữ liệu giả lập và huấn luyện mô hình.
------------------------------------------------------------
-"""
+from __future__ import annotations
+
+import io
+import logging
+import traceback
+from typing import Iterable, TypeAlias
+
+from lightning import pytorch as pl
 import torch
-import torch.nn as nn
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import MessagePassing, GINConv
+from torch import Tensor, nn, optim
+from torch_geometric.nn import GINConv, global_add_pool
 from torch_geometric.utils import to_undirected, add_self_loops, k_hop_subgraph
 
-import lightning as pl
-from torch import optim, Tensor
+from chemprop.data import BatchMolGraph, MulticomponentTrainingBatch, TrainingBatch
+from chemprop.nn import ChempropMetric, MessagePassing, Predictor
+from chemprop.nn.transforms import ScaleTransform
+from chemprop.schedulers import build_NoamLike_LRSched
+from chemprop.utils.registry import Factory
 
-# =============================================================================
-# PHẦN 1: KIẾN TRÚC GNN PHẢN ỨNG (Lấy từ mã gốc của bạn)
-# =============================================================================
+logger = logging.getLogger(__name__)
 
-# ---------- 0. Misc helpers --------------------------------------------------
+BatchType: TypeAlias = TrainingBatch | MulticomponentTrainingBatch
+
+# ==============================================================================
+# ---------- CÁC LỚP PHỤ TRỢ (HELPER COMPONENTS) -------------------------------
+# ==============================================================================
 
 def add_k_jump_edges(edge_index, num_nodes, k: int = 3):
-    """
-    Thêm các cạnh k-jump để giảm đường kính đồ thị.
-    """
+    """Thêm các cạnh ảo k-bước để thu nhỏ đường kính đồ thị."""
     if k <= 1:
         return edge_index
     
     new_edges = []
     for hop in range(2, k + 1):
+        # Sử dụng k_hop_subgraph để tìm các hàng xóm bậc cao
         _, _, n_hop, _ = k_hop_subgraph(
-            None, hop, edge_index, num_nodes=num_nodes, relabel_nodes=False)
+            node_idx=None, # Áp dụng cho tất cả các nút
+            num_hops=hop,
+            edge_index=edge_index,
+            num_nodes=num_nodes,
+            relabel_nodes=False
+        )
         new_edges.append(n_hop)
+    
     if len(new_edges):
         edge_index = torch.cat([edge_index] + new_edges, dim=1)
+        
     return to_undirected(edge_index)
 
-# ---------- 1. Two-layer Atom-level DMPNN ------------------------------------
-
-class DMPNNLayer(MessagePassing):
-    def __init__(self, in_dim, edge_dim):
-        super().__init__(aggr='add')
-        self.W_msg = nn.Linear(in_dim + edge_dim, in_dim, bias=False)
-        self.gru   = nn.GRUCell(in_dim, in_dim)
-
-    def forward(self, x, edge_index, edge_attr):
-        m = self.propagate(edge_index, x=x, edge_attr=edge_attr)
-        x = self.gru(m, x)
-        return x
-
-    def message(self, x_j, edge_attr):
-        return self.W_msg(torch.cat([x_j, edge_attr], dim=-1))
-
-class AtomDMPNN(nn.Module):
-    """Level-0/1 local encoder: 2 directed-edge DMPNN layers."""
-    def __init__(self, hidden, edge_dim):
-        super().__init__()
-        self.gnn1 = DMPNNLayer(hidden, edge_dim)
-        self.gnn2 = DMPNNLayer(hidden, edge_dim)
-
-    def forward(self, x, edge_index, edge_attr):
-        x = self.gnn1(x, edge_index, edge_attr)
-        x = self.gnn2(x, edge_index, edge_attr)
-        return x
-
-# ---------- 2. MixHop (single block)  ----------------------------------------
 
 class MixHopConv(nn.Module):
-    """
-    Parallel 1-,2-,3-hop GINs whose outputs are concatenated.
-    """
+    """Khối MixHop: chạy GINConv song song ở các tầm nhìn khác nhau."""
     def __init__(self, hidden, hops=(1, 2, 3)):
         super().__init__()
         self.hops = hops
+        
+        # # Tạo MLP cho GINConv một cách tường minh hơn
+        # conv_mlps = []
+        # for _ in hops:
+        #     mlp = nn.Sequential(
+        #         nn.Linear(hidden, hidden), 
+        #         nn.ReLU(), 
+        #         nn.Linear(hidden, hidden)
+        #     )
+        #     conv_mlps.append(GINConv(mlp))
+        
+        # self.convs = nn.ModuleList(conv_mlps)
+        
+        # self.out_proj = nn.Linear(hidden * len(hops), hidden)
+
         self.convs = nn.ModuleList([
             GINConv(nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden)))
             for _ in hops
@@ -95,216 +86,266 @@ class MixHopConv(nn.Module):
         x = self.out_proj(torch.cat(outs, dim=-1))
         return x
 
-# ---------- 3. Gated Skip-edge block  ----------------------------------------
 
 class GatedSkipBlock(nn.Module):
     """
-    One hop, gated spectators (non-RC atom -> supernode S).
+    Cổng hóa thông tin từ các nguyên tử và tổng hợp chúng cho mỗi phân tử trong batch.
+    Lớp này hoạt động trên toàn bộ batch một cách vector hóa.
     """
     def __init__(self, hidden):
         super().__init__()
-        self.gate = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, 1))
-        self.W    = nn.Linear(hidden, hidden, bias=False)
-        self.gru  = nn.GRUCell(hidden, hidden)
+        # Mạng nơ-ron nhỏ để tính toán "cổng" alpha cho mỗi nguyên tử
+        self.gate_nn = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, 1))
+        # Lớp linear để biến đổi đặc trưng nguyên tử trước khi nhân với cổng
+        self.message_transform = nn.Linear(hidden, hidden, bias=False)
 
-    def forward(self, h, rc_mask, idx_S):
-        N = rc_mask.size(0)
-        idx_atoms = torch.arange(N, device=h.device)
-        non_rc    = idx_atoms[~rc_mask]
+    def forward(self, h_atoms: Tensor, batch_map: Tensor) -> Tensor:
+        """
+        Args:
+            h_atoms: Tensor đặc trưng của tất cả các nguyên tử trong batch [N_total_atoms, hidden_size].
+            batch_map: Vector ánh xạ mỗi nguyên tử tới chỉ số phân tử của nó [N_total_atoms].
 
-        alpha   = torch.sigmoid(self.gate(h[non_rc]))
-        msgs    = alpha * self.W(h[non_rc])
-        m_sum   = msgs.sum(0, keepdim=True)
+        Returns:
+            Tensor tin nhắn tổng hợp cho mỗi phân tử trong batch [batch_size, hidden_size].
+        """
+        # 1. Tính toán cổng alpha cho mỗi nguyên tử
+        alpha = torch.sigmoid(self.gate_nn(h_atoms))  # Shape: [N_total_atoms, 1]
 
-        m_rc    = self.W(h[-2:-1])
-        m_total = m_sum + m_rc
+        # 2. Tạo tin nhắn từ mỗi nguyên tử
+        messages = self.message_transform(h_atoms)  # Shape: [N_total_atoms, hidden_size]
 
-        h_S_new = self.gru(m_total, h[idx_S:idx_S+1])
-        h[idx_S] = h_S_new
-        return h
+        # 3. Áp dụng cổng vào tin nhắn
+        gated_messages = alpha * messages  # Shape: [N_total_atoms, hidden_size]
 
-# ---------- 4. Whole Reaction Encoder  ---------------------------------------
+        # 4. Tổng hợp các tin nhắn theo từng phân tử
+        aggregated_messages = global_add_pool(gated_messages, batch_map) # Shape: [batch_size, hidden_size]
 
-class ReactionEncoder(nn.Module):
-    def __init__(self, hidden, edge_dim, k_jump=3):
-        super().__init__()
-        self.hidden = hidden
-        self.k_jump = k_jump
-        self.atom_dmpnn = AtomDMPNN(hidden, edge_dim)
-        self.mixhop = MixHopConv(hidden)
-        self.att_q = nn.Linear(hidden, hidden)
-        self.att_k = nn.Linear(hidden, hidden)
-        self.att_v = nn.Linear(hidden, hidden)
-        self.out_linear = nn.Linear(hidden, hidden)
-        self.skip_block = GatedSkipBlock(hidden)
-        self.rc_init = nn.Parameter(torch.zeros(1, hidden))
-        self.s_init  = nn.Parameter(torch.zeros(1, hidden))
-        nn.init.xavier_normal_(self.rc_init)
-        nn.init.xavier_normal_(self.s_init)
+        return aggregated_messages
 
-    def _augment_graph(self, data):
-        N_atoms = data.x.size(0)
-        edge_index = add_self_loops(data.edge_index, num_nodes=N_atoms)[0]
-        edge_index = add_k_jump_edges(edge_index, N_atoms, k=self.k_jump)
-        rc_idx = N_atoms
-        s_idx  = N_atoms + 1
-        rc_atoms = data.rc_mask.nonzero(as_tuple=True)[0]
-        rc_edges = torch.stack([torch.cat([rc_atoms, rc_atoms.clone().fill_(rc_idx)]),
-                                torch.cat([rc_atoms.clone().fill_(rc_idx), rc_atoms])], dim=0)
-        rc_s = torch.tensor([[rc_idx, s_idx], [s_idx, rc_idx]], dtype=torch.long, device=edge_index.device)
-        non_rc = (~data.rc_mask).nonzero(as_tuple=True)[0]
-        skip_e = torch.stack([torch.cat([non_rc, non_rc.clone().fill_(s_idx)]),
-                              torch.cat([non_rc.clone().fill_(s_idx), non_rc])], dim=0)
-        edge_index = torch.cat([edge_index, rc_edges, rc_s, skip_e], dim=1)
-        edge_index = to_undirected(edge_index)
-        return edge_index, rc_idx, s_idx
 
-    def forward(self, data):
-        h_atoms_dmpnn = self.atom_dmpnn(data.x, data.edge_index, data.edge_attr)
-        h_atoms_mixhop = self.mixhop(h_atoms_dmpnn, data.edge_index)
-        
-        edge_index, rc_idx, s_idx = self._augment_graph(data)
-        h = torch.cat([h_atoms_mixhop, self.rc_init, self.s_init], dim=0)
-        h = self.skip_block(h, data.rc_mask, s_idx)
-        
-        q = self.att_q(h)
-        k = self.att_k(h)
-        v = self.att_v(h)
-        attn = (q @ k.T) / (self.hidden ** 0.5)
-        attn = attn.softmax(dim=-1)
-        h_attn = h + self.out_linear(attn @ v)
-        
-        # Mở rộng h_atoms để phù hợp với kích thước của h_attn cho JK
-        h_atoms_padded = torch.nn.functional.pad(h_atoms_mixhop, (0, 0, 0, 2))
+# ==============================================================================
+# ---------- LỚP MPNN ĐÃ ĐƯỢC CHỈNH SỬA VÀ HOÀN THIỆN --------------------------
+# ==============================================================================
 
-        h_nodes = torch.stack([h_atoms_padded, h_attn], dim=0)
-        h_jk = h_nodes.max(0).values
-        
-        h_S = h_jk[s_idx]
-        return h_S
-
-# ---------- 5. Property head & full model -------------------------------
-
-class ReactionPropertyModel(nn.Module):
-    def __init__(self, hidden, edge_dim, k_jump=3, out_dim=1):
-        super().__init__()
-        self.encoder = ReactionEncoder(hidden, edge_dim, k_jump)
-        self.mlp = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, out_dim))
-
-    def forward(self, data):
-        h_S = self.encoder(data)
-        return self.mlp(h_S)
-
-# =============================================================================
-# PHẦN 2: TÍCH HỢP PYTORCH LIGHTNING (THAY THẾ LỚP MPNN CŨ)
-# =============================================================================
-
-class ReactionMPNN(pl.LightningModule):
+class MPNN_Modified(pl.LightningModule):
     """
-    Một lớp LightningModule để huấn luyện mô hình ReactionPropertyModel.
-    Lớp này thay thế lớp MPNN gốc của chemprop, sử dụng kiến trúc GNN
-    mới và làm việc với dữ liệu từ PyTorch Geometric.
+    Phiên bản MPNN nâng cao, tích hợp các ý tưởng:
+    - K-Jump Rewiring
+    - MixHop Block
+    - Global Super-node 'S'
+    - Gated Skip Connections
+    - Jump Knowledge
     """
     def __init__(
         self,
-        hidden_dim: int,
-        edge_dim: int,
+        message_passing: MessagePassing,
+        predictor: Predictor,
         k_jump: int = 3,
-        out_dim: int = 1,
+        metrics: Iterable[ChempropMetric] | None = None,
         warmup_epochs: int = 2,
         init_lr: float = 1e-4,
         max_lr: float = 1e-3,
         final_lr: float = 1e-4,
-        loss_fn: str = "mse",
+        X_d_transform: ScaleTransform | None = None,
     ):
         super().__init__()
-        # Lưu các siêu tham số để dễ dàng checkpoint và tải lại
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["X_d_transform", "message_passing", "predictor"])
+        hidden_dim = message_passing.output_dim
 
-        self.model = ReactionPropertyModel(
-            hidden=hidden_dim,
-            edge_dim=edge_dim,
-            k_jump=k_jump,
-            out_dim=out_dim
-        )
-        if loss_fn == "mse":
-            self.criterion = nn.MSELoss()
-        elif loss_fn == "l1":
-            self.criterion = nn.L1Loss()
-        else:
-            raise ValueError(f"Loss function '{loss_fn}' không được hỗ trợ.")
-
-    def forward(self, data: Data | DataLoader.Collater) -> Tensor:
-        """
-        Thực hiện một lượt dự đoán.
-        Input `data` là một batch từ PyG DataLoader.
-        """
-        return self.model(data)
-
-    def _shared_step(self, batch, batch_idx):
-        """Hàm dùng chung cho training, validation, và test."""
-        # `batch` ở đây là một đối tượng `torch_geometric.data.Batch`
-        # Nhãn (target) được lưu trong `batch.y`
-        targets = batch.y
+        # Các khối kiến trúc
+        self.message_passing = message_passing
+        self.mixhop = MixHopConv(hidden_dim)
+        self.skip_block = GatedSkipBlock(hidden_dim)
+        self.predictor = predictor
         
-        # Dự đoán
-        preds = self(batch).squeeze(-1)
+        # Các tham số và cấu hình
+        self.k_jump = k_jump
+        self.s_init = nn.Parameter(torch.zeros(1, hidden_dim))
+        self.s_gru = nn.GRUCell(hidden_dim, hidden_dim) # GRU cell để cập nhật trạng thái siêu nút
+        self.X_d_transform = X_d_transform if X_d_transform is not None else nn.Identity()
+
+        # Cấu hình Metrics và Tốc độ học
+        self.metrics = nn.ModuleList([*metrics, self.criterion.clone()]) if metrics else nn.ModuleList([self.predictor._T_default_metric(), self.criterion.clone()])
+        self.warmup_epochs, self.init_lr, self.max_lr, self.final_lr = warmup_epochs, init_lr, max_lr, final_lr
+
+    @property
+    def criterion(self) -> ChempropMetric:
+        return self.predictor.criterion
         
-        # Tính loss
-        loss = self.criterion(preds, targets)
+    @property
+    def n_tasks(self) -> int:
+        return self.predictor.n_tasks
+
+    def fingerprint(self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None) -> Tensor:
+        """Luồng tính toán 'dấu vân tay' đã được sửa lỗi và vector hóa."""
+        # 1. Lớp MPNN ban đầu để lấy đặc trưng cục bộ
+        h_mp = self.message_passing(bmg, V_d)
+
+        # 2. Lớp MixHop để lấy đặc trưng đa quy mô
+        edge_index_k_jump = add_k_jump_edges(bmg.edge_index, bmg.n_atoms, k=self.k_jump)
+        h_mixhop = self.mixhop(h_mp, edge_index_k_jump)
+
+        # 3. Jump Knowledge: Kết hợp các đặc trưng
+        h_atoms = h_mp + h_mixhop
+
+        # 4. Lấy tin nhắn tổng hợp từ các nguyên tử thông qua GatedSkipBlock
+        aggregated_atom_messages = self.skip_block(h_atoms, bmg.batch)
+
+        # 5. Cập nhật trạng thái siêu nút S
+        num_mols = len(bmg)
+        s_state = self.s_init.repeat(num_mols, 1) # Trạng thái ban đầu của siêu nút cho cả batch
+        s_state_updated = self.s_gru(aggregated_atom_messages, s_state) # Cập nhật trạng thái
         
-        return loss, preds, targets
+        # 6. Dấu vân tay cuối cùng chính là trạng thái của các siêu nút
+        H = s_state_updated
+        
+        return H if X_d is None else torch.cat((H, self.X_d_transform(X_d)), dim=1)
 
-    def training_step(self, batch, batch_idx):
-        loss, _, _ = self._shared_step(batch, batch_idx)
-        # `prog_bar=True` để hiển thị loss trên thanh tiến trình
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch.num_graphs)
-        return loss
+    def forward(self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None) -> Tensor:
+        """Quá trình truyền thẳng."""
+        return self.predictor(self.fingerprint(bmg, V_d, X_d))
 
-    def validation_step(self, batch, batch_idx):
-        loss, _, _ = self._shared_step(batch, batch_idx)
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch.num_graphs)
-        return loss
-
-    def test_step(self, batch, batch_idx):
-        loss, _, _ = self._shared_step(batch, batch_idx)
-        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch.num_graphs)
+    def training_step(self, batch: BatchType, batch_idx):
+        batch_size = len(batch[0])
+        bmg, V_d, X_d, targets, weights, lt_mask, gt_mask = batch
+        mask = targets.isfinite()
+        targets = targets.nan_to_num(nan=0.0)
+        
+        Z = self.fingerprint(bmg, V_d, X_d)
+        preds = self.predictor.train_step(Z)
+        loss = self.criterion(preds, targets, mask, weights, lt_mask, gt_mask)
+        
+        self.log("train_loss", self.criterion, batch_size=batch_size, prog_bar=True, on_epoch=True)
         return loss
     
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        return self(batch)
+    def on_validation_model_eval(self) -> None:
+        self.eval()
+        self.message_passing.V_d_transform.train()
+        self.message_passing.graph_transform.train()
+        self.X_d_transform.train()
+        self.predictor.output_transform.train()
+    
+    def validation_step(self, batch: BatchType, batch_idx: int = 0):
+        self._evaluate_batch(batch, "val")
 
+        # Log validation loss separately if needed
+        bmg, V_d, X_d, targets, weights, lt_mask, gt_mask = batch
+        mask = targets.isfinite()
+        targets = targets.nan_to_num(nan=0.0)
+        Z = self.fingerprint(bmg, V_d, X_d)
+        preds = self.predictor(Z) # Use forward for eval
+        
+        # Use the last metric, which is the criterion clone
+        self.metrics[-1](preds, targets, mask, weights, lt_mask, gt_mask)
+        self.log("val_loss", self.metrics[-1], batch_size=len(batch[0]), prog_bar=True)
+
+    def test_step(self, batch: BatchType, batch_idx: int = 0):
+        self._evaluate_batch(batch, "test")
+
+    def _evaluate_batch(self, batch: BatchType, label: str) -> None:
+        batch_size = len(batch[0])
+        bmg, V_d, X_d, targets, weights, lt_mask, gt_mask = batch
+
+        mask = targets.isfinite()
+        targets = targets.nan_to_num(nan=0.0)
+        preds = self(bmg, V_d, X_d)
+        
+        # For evaluation, don't use additional scaling on weights
+        weights = torch.ones_like(weights)
+
+        # Log all metrics except the last one (which is the loss function itself)
+        for m in self.metrics[:-1]:
+            m.update(preds, targets, mask, weights, lt_mask, gt_mask)
+            self.log(f"{label}/{m.alias}", m, batch_size=batch_size, on_step=False, on_epoch=True)
+
+    def predict_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int = 0) -> Tensor:
+        bmg, V_d, X_d, *_ = batch
+        return self(bmg, V_d, X_d)
+    
     def configure_optimizers(self):
-        """
-        Thiết lập optimizer và learning rate scheduler.
-        Sử dụng lại cấu hình từ mã gốc của chemprop.
-        """
-        opt = optim.Adam(self.parameters(), self.hparams.init_lr)
+        opt = optim.Adam(self.parameters(), self.init_lr)
+        
+        # Gracefully handle case where trainer is not available
+        if self.trainer is None:
+            return {"optimizer": opt}
 
-        # Cần ước tính số bước cho scheduler
         if self.trainer.train_dataloader is None:
             self.trainer.estimated_stepping_batches
-
+            
         steps_per_epoch = self.trainer.num_training_batches
-        warmup_steps = self.hparams.warmup_epochs * steps_per_epoch
-        
+        warmup_steps = self.warmup_epochs * steps_per_epoch
+
         if self.trainer.max_epochs == -1:
-            # Huấn luyện vô hạn
             cooldown_steps = 100 * warmup_steps
         else:
-            cooldown_epochs = self.trainer.max_epochs - self.hparams.warmup_epochs
+            cooldown_epochs = self.trainer.max_epochs - self.warmup_epochs
             cooldown_steps = cooldown_epochs * steps_per_epoch
+            
+        lr_sched = build_NoamLike_LRSched(opt, warmup_steps, cooldown_steps, self.init_lr, self.max_lr, self.final_lr)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": lr_sched, "interval": "step"}}
 
-        lr_sched = torch.optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=self.hparams.max_lr,
-            total_steps=warmup_steps + cooldown_steps,
-            pct_start=warmup_steps / (warmup_steps + cooldown_steps) if (warmup_steps + cooldown_steps) > 0 else 0,
-            div_factor=self.hparams.max_lr / self.hparams.init_lr,
-            final_div_factor=self.hparams.init_lr / self.hparams.final_lr,
-            anneal_strategy='linear'
-        )
+    # ----- Các phương thức tiện ích và tải mô hình -----
+    
+    @classmethod
+    def _load(cls, path, map_location, **submodules):
+        try:
+            d = torch.load(path, map_location, weights_only=False)
+        except AttributeError:
+            logger.error(
+                f"{traceback.format_exc()}\nModel loading failed! It's possible this checkpoint "
+                "was generated in v2.0 and needs to be converted to v2.1.\nPlease run "
+                f"'chemprop convert --conversion v2_0_to_v2_1 -i {path}' and load the converted checkpoint."
+            )
+            raise
+        
+        try:
+            hparams = d["hyper_parameters"]
+            state_dict = d["state_dict"]
+        except KeyError:
+            raise KeyError(f"Could not find hyper parameters and/or state dict in {path}.")
 
-        lr_sched_config = {"scheduler": lr_sched, "interval": "step"}
+        # Rebuild metrics if necessary
+        if hparams.get("metrics") is not None:
+            hparams["metrics"] = [
+                cls._rebuild_metric(metric)
+                if not hasattr(metric, "_defaults") or (not torch.cuda.is_available() and metric.device.type != "cpu")
+                else metric
+                for metric in hparams["metrics"]
+            ]
+        
+        # Rebuild criterion if necessary
+        if hparams.get("predictor", {}).get("criterion") is not None:
+            metric = hparams["predictor"]["criterion"]
+            if not hasattr(metric, "_defaults") or (not torch.cuda.is_available() and metric.device.type != "cpu"):
+                hparams["predictor"]["criterion"] = cls._rebuild_metric(metric)
 
-        return {"optimizer": opt, "lr_scheduler": lr_sched_config}
+        # Rebuild submodules from hparams if not provided
+        # NOTE: Removed 'agg' as it's no longer a direct component
+        submodules |= {
+            key: Factory.build(hparams[key].pop("cls"), **hparams[key])
+            for key in ("message_passing", "predictor")
+            if key not in submodules
+        }
+
+        return submodules, state_dict, hparams
+
+    @classmethod
+    def _rebuild_metric(cls, metric):
+        return Factory.build(metric.__class__, task_weights=metric.task_weights, **metric.__dict__)
+
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path, map_location=None, hparams_file=None, strict=True, **kwargs) -> "MPNN_Modified":
+        # NOTE: Removed 'agg' from submodule check
+        submodules = {k: v for k, v in kwargs.items() if k in ["message_passing", "predictor"]}
+        submodules, state_dict, hparams = cls._load(checkpoint_path, map_location, **submodules)
+        kwargs.update(submodules)
+
+        # The following logic with buffer is a workaround for a PyTorch Lightning loading issue
+        d = torch.load(checkpoint_path, map_location, weights_only=False)
+        d["state_dict"] = state_dict
+        d["hyper_parameters"] = hparams
+        buffer = io.BytesIO()
+        torch.save(d, buffer)
+        buffer.seek(0)
+
+        return super().load_from_checkpoint(buffer, map_location=map_location, hparams_file=hparams_file, strict=strict, **kwargs)
